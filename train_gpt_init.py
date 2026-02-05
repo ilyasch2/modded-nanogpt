@@ -226,7 +226,6 @@ class ParamConfig:
     weight_decay: float
     # Adam-specific
     eps: float | None = None
-    initial_adam_betas: tuple[float, float] | None = None  # Final target betas for warmup schedule
     # NorMuon-specific
     reshape: tuple | None = None
     chunk_size: int | None = None
@@ -324,8 +323,6 @@ class NorMuonAndAdam:
         self._step_size_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -351,7 +348,6 @@ class NorMuonAndAdam:
                 optim=optim,
                 comms=comms,
                 adam_betas=tuple(adam_betas) if adam_betas else None,
-                initial_adam_betas=tuple(adam_betas) if adam_betas else None,  # Store final target betas
                 lr_mul=lr_mul,
                 wd_mul=wd_mul,
                 lr=self.adam_defaults["lr"],
@@ -685,17 +681,13 @@ class NorMuonAndAdam:
         p_state["step"] += 1
         t = p_state["step"]
 
-        # Fill beta tensors to avoid recompilation
-        self._beta1_t.fill_(beta1)
-        self._beta2_t.fill_(beta2)
-
         bias1, bias2 = 1 - beta1 ** t, 1 - beta2 ** t
         self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
         self._eff_wd_t.fill_(lr * lr * p_cfg.weight_decay * p_cfg.wd_mul)
 
         NorMuonAndAdam._adam_update_step(
             p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
-            self._beta1_t, self._beta2_t, p_cfg.eps, self._step_size_t, self._eff_wd_t
+            beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t
         )
 
         return p_slice
@@ -1435,21 +1427,11 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", 1515))  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = int(os.environ.get("NUM_EXTENSION_ITERATIONS", 40))  # number of steps to continue training at final lr and ws
-    beta_warmup_steps: int = int(os.environ.get("BETA_WARMUP_STEPS", 0))  # number of steps to warmup Adam betas from 0 to final values
+    num_scheduled_iterations: int = 1515  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
-    run_id: str = os.environ.get("RUN_ID", f"{uuid.uuid4()}")
-    val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 10))  # every how many steps to evaluate val loss? 0 for only at the end
-    val_loss_every_last: int = int(os.environ.get("VAL_LOSS_EVERY_LAST", 10))  # cadence for last N steps
-    val_loss_last_steps: int = int(os.environ.get("VAL_LOSS_LAST_STEPS", 0))  # if >0, use val_loss_every_last in the final N steps
-    lr_decay_type: str = os.environ.get("LR_DECAY_TYPE", "linear")  # linear or exp
-    lr_decay_final: float = float(os.environ.get("LR_DECAY_FINAL", 0.1))  # final lr multiplier after cooldown
-    lr_decay_switch_step: int = int(os.environ.get("LR_DECAY_SWITCH_STEP", 0))  # 0 disables second decay stage
-    lr_decay_second_type: str = os.environ.get("LR_DECAY_SECOND_TYPE", "")  # constant or linear
-    lr_decay_second_final: float | None = (
-        float(os.environ["LR_DECAY_SECOND_FINAL"]) if "LR_DECAY_SECOND_FINAL" in os.environ else None
-    )
+    run_id: str = f"{uuid.uuid4()}"
+    val_loss_every: int = 10  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
@@ -1477,18 +1459,10 @@ class TrainingSchedule:
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
-                 cooldown_frac: float = 0.5, split_embed_stage: int = 2, ws_post_yarn_ext: int = 20,
-                 decay_type: str = "linear", decay_final: float = 0.1,
-                 decay_switch_step: int | None = None, decay_second_type: str | None = None,
-                 decay_second_final: float | None = None):
+                 cooldown_frac: float = 0.5, split_embed_stage: int = 2, ws_post_yarn_ext: int = 20):
         self.stages = stages
         self.scheduled_iterations = scheduled_iterations
         self.cooldown_frac = cooldown_frac
-        self.decay_type = decay_type
-        self.decay_final = decay_final
-        self.decay_switch_step = decay_switch_step
-        self.decay_second_type = decay_second_type
-        self.decay_second_final = decay_second_final
         # increase final validation ws, used for YaRN extension and short window size @classiclarryd
         self.ws_post_yarn_ext = ws_post_yarn_ext
 
@@ -1520,42 +1494,11 @@ class TrainingSchedule:
     def get_lr(self, step: int) -> float:
         # learning rate schedule: tied to batch size schedule, with cooldown at the end
         stage, _ = self.lookup(step)
-        base_lr = stage.lr_mul
-        lr = base_lr
+        lr = stage.lr_mul
         cd_start = int(self.scheduled_iterations * (1 - self.cooldown_frac))
         if step >= cd_start:
-            denom = self.scheduled_iterations - cd_start
-            t = min(1.0, (step - cd_start) / denom) if denom > 0 else 1.0
-            if self.decay_type == "exp":
-                lr_primary = base_lr * (self.decay_final ** t)
-            else:
-                lr_primary = base_lr * (1 - t) + self.decay_final * t
-
-            lr = lr_primary
-            if self.decay_switch_step is not None and self.decay_second_type:
-                switch_step = self.decay_switch_step
-                if switch_step > cd_start and step >= switch_step:
-                    t_switch = min(1.0, (switch_step - cd_start) / denom) if denom > 0 else 1.0
-                    if self.decay_type == "exp":
-                        lr_switch = base_lr * (self.decay_final ** t_switch)
-                    else:
-                        lr_switch = base_lr * (1 - t_switch) + self.decay_final * t_switch
-
-                    end_mul = self.decay_second_final if self.decay_second_final is not None else self.decay_final
-                    end_lr = base_lr * end_mul
-
-                    denom2 = self.scheduled_iterations - switch_step
-                    t2 = min(1.0, (step - switch_step) / denom2) if denom2 > 0 else 1.0
-                    if self.decay_second_type == "constant":
-                        lr = lr_switch
-                    elif self.decay_second_type == "linear":
-                        lr = lr_switch * (1 - t2) + end_lr * t2
-                    elif self.decay_second_type == "exp":
-                        ratio = end_lr / max(lr_switch, 1e-12)
-                        lr = lr_switch * (ratio ** t2)
-                    else:
-                        lr = lr_primary
-        # print(f"The current lr is {lr}")
+            t = min(1.0, (step - cd_start) / (self.scheduled_iterations - cd_start))
+            lr = lr * (1 - t) + 0.1 * t
         return lr
 
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
@@ -1571,55 +1514,7 @@ TRAINING_STAGES = [
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
-def _parse_env_float_list(env_name: str) -> list[float] | None:
-    raw = os.environ.get(env_name)
-    if not raw:
-        return None
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    return [float(p) for p in parts]
-
-def _parse_env_int_list(env_name: str) -> list[int] | None:
-    raw = os.environ.get(env_name)
-    if not raw:
-        return None
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    return [int(p) for p in parts]
-
-_lr_muls = _parse_env_float_list("LR_MULS")
-if _lr_muls is not None:
-    if len(_lr_muls) == len(TRAINING_STAGES) - 1:
-        _lr_muls.append(TRAINING_STAGES[-1].lr_mul)
-    if len(_lr_muls) != len(TRAINING_STAGES):
-        raise ValueError(f"LR_MULS must have {len(TRAINING_STAGES)} values, got {len(_lr_muls)}")
-    for stage, lr_mul in zip(TRAINING_STAGES, _lr_muls):
-        stage.lr_mul = lr_mul
-
-_batch_sizes = _parse_env_int_list("BATCH_SIZES")
-if _batch_sizes is not None:
-    if len(_batch_sizes) == len(TRAINING_STAGES) - 1:
-        _batch_sizes.append(TRAINING_STAGES[-1].batch_size)
-    if len(_batch_sizes) != len(TRAINING_STAGES):
-        raise ValueError(f"BATCH_SIZES must have {len(TRAINING_STAGES)} values, got {len(_batch_sizes)}")
-    for stage, batch_size in zip(TRAINING_STAGES, _batch_sizes):
-        stage.batch_size = batch_size
-
-cooldown_frac = float(os.environ.get("COOLDOWN_FRAC", 0.55))
-decay_type = args.lr_decay_type
-decay_final = args.lr_decay_final
-decay_switch_step = args.lr_decay_switch_step if args.lr_decay_switch_step > 0 else None
-decay_second_type = args.lr_decay_second_type if args.lr_decay_second_type else None
-decay_second_final = args.lr_decay_second_final
-training_schedule = TrainingSchedule(
-    TRAINING_STAGES,
-    args.num_scheduled_iterations,
-    args.num_extension_iterations,
-    cooldown_frac=cooldown_frac,
-    decay_type=decay_type,
-    decay_final=decay_final,
-    decay_switch_step=decay_switch_step,
-    decay_second_type=decay_second_type,
-    decay_second_final=decay_second_final,
-)
+training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
@@ -1634,28 +1529,6 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
     else:
         momentum = momentum_max
     return momentum
-
-def get_adam_betas(step: int, beta1_final: float, beta2_final: float, beta_warmup_steps: int = 200):
-    """
-    Linear warmup for Adam betas from [0, 0] to [beta1_final, beta2_final].
-
-    Args:
-        step: Current training step
-        beta1_final: Target value for beta1 after warmup
-        beta2_final: Target value for beta2 after warmup
-        beta_warmup_steps: Number of steps to warmup betas (default: 200)
-
-    Returns:
-        Tuple of (beta1, beta2) for the current step
-    """
-    if step < beta_warmup_steps:
-        frac = step / beta_warmup_steps
-        beta1 = frac * beta1_final
-        beta2 = frac * beta2_final
-    else:
-        beta1 = beta1_final
-        beta2 = beta2_final
-    return (beta1, beta2)
 
 class TrainingManager():
     """
@@ -1764,15 +1637,11 @@ class TrainingManager():
         muon_momentum = get_muon_momentum(step)
         do_adam = self._is_adam_step(step)
 
-        # Update learning rates, momentum, and betas for all params
+        # Update learning rates and momentum for all params
         for param, p_cfg in self.optimizer.param_cfgs.items():
             p_cfg.lr = p_cfg.initial_lr * step_lr
             if p_cfg.optim == "normuon":
                 p_cfg.momentum = muon_momentum
-            elif p_cfg.optim == "adam" and p_cfg.initial_adam_betas is not None:
-                # Apply beta warmup schedule
-                beta1_final, beta2_final = p_cfg.initial_adam_betas
-                p_cfg.adam_betas = get_adam_betas(step, beta1_final, beta2_final, args.beta_warmup_steps)
 
         # Step optimizer with do_adam flag
         self.optimizer.step(do_adam=do_adam)
@@ -1895,20 +1764,11 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = training_schedule.total_steps
-
-def _should_run_val(step: int, train_steps: int) -> bool:
-    if step == train_steps:
-        return True
-    if args.val_loss_last_steps > 0 and step >= train_steps - args.val_loss_last_steps:
-        every = args.val_loss_every_last
-    else:
-        every = args.val_loss_every
-    return every > 0 and step % every == 0
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
     # --------------- VALIDATION SECTION -----------------
-    if _should_run_val(step, train_steps):
+    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
             training_manager.apply_final_ws_ext()
         # stop the clock
@@ -1926,15 +1786,7 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        lr_mul = training_schedule.get_lr(step)
-        batch_size = training_manager.batch_size
-        # Get beta values from lm_head param (representative Adam param)
-        lm_head_param = training_manager.optimizer._param_by_label.get("lm_head")
-        if lm_head_param is not None and lm_head_param in training_manager.optimizer.param_cfgs:
-            beta1, beta2 = training_manager.optimizer.param_cfgs[lm_head_param].adam_betas
-        else:
-            beta1, beta2 = 0.0, 0.0
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} lr_mul:{lr_mul:.4f} beta1:{beta1:.4f} beta2:{beta2:.4f} batch_size:{batch_size} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1956,15 +1808,7 @@ for step in range(train_steps + 1):
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    lr_mul = training_schedule.get_lr(step + 1)
-    batch_size = training_manager.batch_size
-    # Get beta values from lm_head param (representative Adam param)
-    lm_head_param = training_manager.optimizer._param_by_label.get("lm_head")
-    if lm_head_param is not None and lm_head_param in training_manager.optimizer.param_cfgs:
-        beta1, beta2 = training_manager.optimizer.param_cfgs[lm_head_param].adam_betas
-    else:
-        beta1, beta2 = 0.0, 0.0
-    print0(f"step:{step+1}/{train_steps} lr_mul:{lr_mul:.4f} beta1:{beta1:.4f} beta2:{beta2:.4f} batch_size:{batch_size} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)

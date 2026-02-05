@@ -324,8 +324,6 @@ class NorMuonAndAdam:
         self._step_size_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -685,17 +683,13 @@ class NorMuonAndAdam:
         p_state["step"] += 1
         t = p_state["step"]
 
-        # Fill beta tensors to avoid recompilation
-        self._beta1_t.fill_(beta1)
-        self._beta2_t.fill_(beta2)
-
         bias1, bias2 = 1 - beta1 ** t, 1 - beta2 ** t
         self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
         self._eff_wd_t.fill_(lr * lr * p_cfg.weight_decay * p_cfg.wd_mul)
 
         NorMuonAndAdam._adam_update_step(
             p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
-            self._beta1_t, self._beta2_t, p_cfg.eps, self._step_size_t, self._eff_wd_t
+            beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t
         )
 
         return p_slice
@@ -1435,21 +1429,12 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", 1515))  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = int(os.environ.get("NUM_EXTENSION_ITERATIONS", 40))  # number of steps to continue training at final lr and ws
-    beta_warmup_steps: int = int(os.environ.get("BETA_WARMUP_STEPS", 0))  # number of steps to warmup Adam betas from 0 to final values
+    num_scheduled_iterations: int = 1515  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    beta_warmup_steps: int = 200  # number of steps to warmup Adam betas from 0 to final values
     # evaluation and logging
-    run_id: str = os.environ.get("RUN_ID", f"{uuid.uuid4()}")
-    val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 10))  # every how many steps to evaluate val loss? 0 for only at the end
-    val_loss_every_last: int = int(os.environ.get("VAL_LOSS_EVERY_LAST", 10))  # cadence for last N steps
-    val_loss_last_steps: int = int(os.environ.get("VAL_LOSS_LAST_STEPS", 0))  # if >0, use val_loss_every_last in the final N steps
-    lr_decay_type: str = os.environ.get("LR_DECAY_TYPE", "linear")  # linear or exp
-    lr_decay_final: float = float(os.environ.get("LR_DECAY_FINAL", 0.1))  # final lr multiplier after cooldown
-    lr_decay_switch_step: int = int(os.environ.get("LR_DECAY_SWITCH_STEP", 0))  # 0 disables second decay stage
-    lr_decay_second_type: str = os.environ.get("LR_DECAY_SECOND_TYPE", "")  # constant or linear
-    lr_decay_second_final: float | None = (
-        float(os.environ["LR_DECAY_SECOND_FINAL"]) if "LR_DECAY_SECOND_FINAL" in os.environ else None
-    )
+    run_id: str = f"{uuid.uuid4()}"
+    val_loss_every: int = 10  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
@@ -1477,18 +1462,10 @@ class TrainingSchedule:
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
-                 cooldown_frac: float = 0.5, split_embed_stage: int = 2, ws_post_yarn_ext: int = 20,
-                 decay_type: str = "linear", decay_final: float = 0.1,
-                 decay_switch_step: int | None = None, decay_second_type: str | None = None,
-                 decay_second_final: float | None = None):
+                 cooldown_frac: float = 0.5, split_embed_stage: int = 2, ws_post_yarn_ext: int = 20):
         self.stages = stages
         self.scheduled_iterations = scheduled_iterations
         self.cooldown_frac = cooldown_frac
-        self.decay_type = decay_type
-        self.decay_final = decay_final
-        self.decay_switch_step = decay_switch_step
-        self.decay_second_type = decay_second_type
-        self.decay_second_final = decay_second_final
         # increase final validation ws, used for YaRN extension and short window size @classiclarryd
         self.ws_post_yarn_ext = ws_post_yarn_ext
 
@@ -1520,41 +1497,11 @@ class TrainingSchedule:
     def get_lr(self, step: int) -> float:
         # learning rate schedule: tied to batch size schedule, with cooldown at the end
         stage, _ = self.lookup(step)
-        base_lr = stage.lr_mul
-        lr = base_lr
+        lr = stage.lr_mul
         cd_start = int(self.scheduled_iterations * (1 - self.cooldown_frac))
         if step >= cd_start:
-            denom = self.scheduled_iterations - cd_start
-            t = min(1.0, (step - cd_start) / denom) if denom > 0 else 1.0
-            if self.decay_type == "exp":
-                lr_primary = base_lr * (self.decay_final ** t)
-            else:
-                lr_primary = base_lr * (1 - t) + self.decay_final * t
-
-            lr = lr_primary
-            if self.decay_switch_step is not None and self.decay_second_type:
-                switch_step = self.decay_switch_step
-                if switch_step > cd_start and step >= switch_step:
-                    t_switch = min(1.0, (switch_step - cd_start) / denom) if denom > 0 else 1.0
-                    if self.decay_type == "exp":
-                        lr_switch = base_lr * (self.decay_final ** t_switch)
-                    else:
-                        lr_switch = base_lr * (1 - t_switch) + self.decay_final * t_switch
-
-                    end_mul = self.decay_second_final if self.decay_second_final is not None else self.decay_final
-                    end_lr = base_lr * end_mul
-
-                    denom2 = self.scheduled_iterations - switch_step
-                    t2 = min(1.0, (step - switch_step) / denom2) if denom2 > 0 else 1.0
-                    if self.decay_second_type == "constant":
-                        lr = lr_switch
-                    elif self.decay_second_type == "linear":
-                        lr = lr_switch * (1 - t2) + end_lr * t2
-                    elif self.decay_second_type == "exp":
-                        ratio = end_lr / max(lr_switch, 1e-12)
-                        lr = lr_switch * (ratio ** t2)
-                    else:
-                        lr = lr_primary
+            t = min(1.0, (step - cd_start) / (self.scheduled_iterations - cd_start))
+            lr = lr * (1 - t) + 0.1 * t
         # print(f"The current lr is {lr}")
         return lr
 
@@ -1571,55 +1518,7 @@ TRAINING_STAGES = [
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
-def _parse_env_float_list(env_name: str) -> list[float] | None:
-    raw = os.environ.get(env_name)
-    if not raw:
-        return None
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    return [float(p) for p in parts]
-
-def _parse_env_int_list(env_name: str) -> list[int] | None:
-    raw = os.environ.get(env_name)
-    if not raw:
-        return None
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    return [int(p) for p in parts]
-
-_lr_muls = _parse_env_float_list("LR_MULS")
-if _lr_muls is not None:
-    if len(_lr_muls) == len(TRAINING_STAGES) - 1:
-        _lr_muls.append(TRAINING_STAGES[-1].lr_mul)
-    if len(_lr_muls) != len(TRAINING_STAGES):
-        raise ValueError(f"LR_MULS must have {len(TRAINING_STAGES)} values, got {len(_lr_muls)}")
-    for stage, lr_mul in zip(TRAINING_STAGES, _lr_muls):
-        stage.lr_mul = lr_mul
-
-_batch_sizes = _parse_env_int_list("BATCH_SIZES")
-if _batch_sizes is not None:
-    if len(_batch_sizes) == len(TRAINING_STAGES) - 1:
-        _batch_sizes.append(TRAINING_STAGES[-1].batch_size)
-    if len(_batch_sizes) != len(TRAINING_STAGES):
-        raise ValueError(f"BATCH_SIZES must have {len(TRAINING_STAGES)} values, got {len(_batch_sizes)}")
-    for stage, batch_size in zip(TRAINING_STAGES, _batch_sizes):
-        stage.batch_size = batch_size
-
-cooldown_frac = float(os.environ.get("COOLDOWN_FRAC", 0.55))
-decay_type = args.lr_decay_type
-decay_final = args.lr_decay_final
-decay_switch_step = args.lr_decay_switch_step if args.lr_decay_switch_step > 0 else None
-decay_second_type = args.lr_decay_second_type if args.lr_decay_second_type else None
-decay_second_final = args.lr_decay_second_final
-training_schedule = TrainingSchedule(
-    TRAINING_STAGES,
-    args.num_scheduled_iterations,
-    args.num_extension_iterations,
-    cooldown_frac=cooldown_frac,
-    decay_type=decay_type,
-    decay_final=decay_final,
-    decay_switch_step=decay_switch_step,
-    decay_second_type=decay_second_type,
-    decay_second_final=decay_second_final,
-)
+training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
@@ -1895,20 +1794,11 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = training_schedule.total_steps
-
-def _should_run_val(step: int, train_steps: int) -> bool:
-    if step == train_steps:
-        return True
-    if args.val_loss_last_steps > 0 and step >= train_steps - args.val_loss_last_steps:
-        every = args.val_loss_every_last
-    else:
-        every = args.val_loss_every
-    return every > 0 and step % every == 0
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
     # --------------- VALIDATION SECTION -----------------
-    if _should_run_val(step, train_steps):
+    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
             training_manager.apply_final_ws_ext()
         # stop the clock
@@ -1927,14 +1817,7 @@ for step in range(train_steps + 1):
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         lr_mul = training_schedule.get_lr(step)
-        batch_size = training_manager.batch_size
-        # Get beta values from lm_head param (representative Adam param)
-        lm_head_param = training_manager.optimizer._param_by_label.get("lm_head")
-        if lm_head_param is not None and lm_head_param in training_manager.optimizer.param_cfgs:
-            beta1, beta2 = training_manager.optimizer.param_cfgs[lm_head_param].adam_betas
-        else:
-            beta1, beta2 = 0.0, 0.0
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} lr_mul:{lr_mul:.4f} beta1:{beta1:.4f} beta2:{beta2:.4f} batch_size:{batch_size} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} lr_mul:{lr_mul:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1957,15 +1840,624 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     lr_mul = training_schedule.get_lr(step + 1)
-    batch_size = training_manager.batch_size
-    # Get beta values from lm_head param (representative Adam param)
-    lm_head_param = training_manager.optimizer._param_by_label.get("lm_head")
-    if lm_head_param is not None and lm_head_param in training_manager.optimizer.param_cfgs:
-        beta1, beta2 = training_manager.optimizer.param_cfgs[lm_head_param].adam_betas
-    else:
-        beta1, beta2 = 0.0, 0.0
-    print0(f"step:{step+1}/{train_steps} lr_mul:{lr_mul:.4f} beta1:{beta1:.4f} beta2:{beta2:.4f} batch_size:{batch_size} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} lr_mul:{lr_mul:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
 dist.destroy_process_group()
+
+
+----------------------------------------
+# triton_kernels.py
+----------------------------------------
+
+import torch
+import triton
+import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+# -----------------------------------------------------------------------------
+# Triton kernel for symmetric matrix multiplication by @byronxu99
+
+@triton.jit
+def _pid_to_block(
+    pid,
+    M,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    # Split output matrix into blocks of size (BLOCK_SIZE_M, BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(M, BLOCK_SIZE_N)
+
+    # Map PID to a single matrix in batch
+    batch_idx = pid // (num_pid_m * num_pid_n)
+    pid = pid % (num_pid_m * num_pid_n)
+
+    # Map PID to 2D grid of blocks
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
+
+    m_idx = pid_m * BLOCK_SIZE_M
+    n_idx = pid_n * BLOCK_SIZE_N
+    return batch_idx, m_idx, n_idx
+
+@triton.jit
+def XXT_kernel(
+    A_ptr, C_ptr,
+    M, K,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    batch_idx, m_idx, n_idx = _pid_to_block(
+        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    # Skip blocks that don't need to be computed
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+
+    # Index into one matrix of batch
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    # Create pointer arrays for A and A.T
+    offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Accumulate over blocks of K
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        at = tl.load(at_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        accumulator = tl.dot(a, at, accumulator)
+        a_ptrs += BLOCK_SIZE_K * a_stride_c
+        at_ptrs += BLOCK_SIZE_K * a_stride_c
+
+    out_dtype = C_ptr.dtype.element_ty
+    output = accumulator.to(out_dtype)
+
+    # Store block of C
+    offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+    tl.store(c_ptrs, output, mask=c_mask)
+
+    # Store block of C mirrored across the diagonal
+    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
+    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
+    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+
+def XXT(A: torch.Tensor, out: torch.Tensor):
+    """
+    Launch Triton kernel to compute C = A @ A.T
+    """
+    assert A.ndim == 2 or A.ndim == 3
+    M, K = A.shape[-2:]
+    assert out.size(-2) == M, "Output matrix has incorrect shape"
+    assert out.size(-1) == M, "Output matrix has incorrect shape"
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    # Hardcoded configs based on H100 autotuning
+    if K == 768:
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
+        num_stages, num_warps = 4, 4
+    else:
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 128, 128
+        num_stages, num_warps = 4, 4
+
+    grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
+    XXT_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        K=K,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=8,
+        LOWER_UPPER=1,
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    return out
+
+@triton.jit
+def ba_plus_cAA_kernel(
+    A_ptr, C_ptr,
+    M,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+    alpha, beta,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+):
+    # This is mostly duplicated from XXT_kernel, but also loads and adds a block of A
+    # Performance is slightly slower than XXT_kernel, so we use two separate kernels
+    pid = tl.program_id(axis=0)
+    batch_idx, m_idx, n_idx = _pid_to_block(
+        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    # Skip blocks that don't need to be computed
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+
+    # Index into one matrix of batch
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    # Create pointer arrays for A and A.T
+    offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Accumulate over blocks of K
+    for k in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
+        at = tl.load(at_ptrs, mask=offs_k[:, None] < M - k * BLOCK_SIZE_K, other=0.0)
+        accumulator = tl.dot(a, at, accumulator)
+        a_ptrs += BLOCK_SIZE_K * a_stride_c
+        at_ptrs += BLOCK_SIZE_K * a_stride_c
+
+    # Load block of A to add (corresponds to the current block of C)
+    offs_am = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_an = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    a_add_ptrs = A_ptr + (offs_am[:, None] * a_stride_r + offs_an[None, :] * a_stride_c)
+    a_add_mask = (offs_am[:, None] < M) & (offs_an[None, :] < M)
+    a_add = tl.load(a_add_ptrs, mask=a_add_mask, other=0.0).to(tl.float32)
+
+    # Apply alpha and beta
+    accumulator *= alpha
+    accumulator += a_add * beta
+
+    out_dtype = C_ptr.dtype.element_ty
+    output = accumulator.to(out_dtype)
+
+    # Store block of C
+    offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+    tl.store(c_ptrs, output, mask=c_mask)
+
+    # Store block of C mirrored across the diagonal
+    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
+    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
+    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+
+def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
+    """
+    Launch Triton kernel to compute C = alpha * A @ A.T + beta * A
+    """
+    assert A.ndim == 2 or A.ndim == 3
+    M, K = A.shape[-2:]
+    assert M == K, "Input matrix must be square"
+    assert out.size(-2) == M
+    assert out.size(-1) == M
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    # Hardcoded config based on H100 autotuning (M=768)
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
+    num_stages, num_warps = 4, 4
+
+    grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
+    ba_plus_cAA_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        alpha=alpha,
+        beta=beta,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=8,
+        LOWER_UPPER=1,
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    return out
+
+# -----------------------------------------------------------------------------
+# Triton kernel for MLP: relu(x @ W1.T)^2, by @andrewbriand, @jrauvola
+
+@triton.jit
+def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
+                                 M, N, K,
+                                 BLOCK_SIZE_M: tl.constexpr,
+                                 BLOCK_SIZE_N: tl.constexpr,
+                                 BLOCK_SIZE_K: tl.constexpr,
+                                 GROUP_SIZE_M: tl.constexpr,
+                                 NUM_SMS: tl.constexpr,
+                                 FORWARD: tl.constexpr,
+                                 ):
+    dtype = tl.bfloat16
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+
+    tile_id_c = start_pid - NUM_SMS
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        tile_id_c += NUM_SMS
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        offs_am_c = pid_m * BLOCK_SIZE_M
+        offs_bn_c = pid_n * BLOCK_SIZE_N
+
+        acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+        acc = tl.permute(acc, (0, 2, 1))
+        acc0, acc1 = tl.split(acc)
+
+        c0 = acc0.to(dtype)
+        if not FORWARD:
+            c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
+            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
+
+        c_desc.store([offs_am_c, offs_bn_c], c0)
+
+        if FORWARD:
+            c0_post = tl.maximum(c0, 0)
+            c0_post = c0_post * c0_post
+            aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+
+        c1 = acc1.to(dtype)
+        if not FORWARD:
+            c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
+            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+
+        c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+
+        if FORWARD:
+            c1_post = tl.maximum(c1, 0)
+            c1_post = c1_post * c1_post
+            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
+
+
+def linear_relu_square(a, b, aux=None):
+    M, K = a.shape
+    N, K = b.shape
+    dtype = a.dtype
+
+    c = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    FORWARD = False
+    if aux is None:
+        FORWARD = True
+        aux = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 256
+    BLOCK_SIZE_K = 64
+    num_stages = 4 if FORWARD else 3
+    num_warps = 8
+
+    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
+    c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+    aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+
+    def grid(META):
+        return (min(
+            NUM_SMS,
+            triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
+        ), )
+
+    linear_relu_square_kernel[grid](
+        a_desc, b_desc, c_desc, aux_desc,
+        M, N, K,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=1,
+        NUM_SMS=NUM_SMS,
+        FORWARD=FORWARD,
+        num_stages=num_stages,
+        num_warps=num_warps
+    )
+
+    if FORWARD:
+        return c, aux
+    else:
+        return c
+
+class FusedLinearReLUSquareFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, W1, W2):
+        pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
+        x3 = post @ W2
+        ctx.save_for_backward(x, W1, W2, pre, post)
+        return x3.view(x.shape)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, W1, W2, pre, post = ctx.saved_tensors
+        dW2 = post.T @ grad_output
+        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
+        dW1 = dpre.T @ x
+        dx = dpre @ W1
+        return dx.view(x.shape), dW1, dW2
+
+# -----------------------------------------------------------------------------
+# Fused Softcapped Cross Entropy
+
+
+@triton.jit
+def fused_softcapped_entropy_fwd_kernel(
+    logits_ptr, losses_ptr, lse_ptr, targets_ptr, mtp_weights_ptr,
+    stride_logits_n, stride_logits_v,
+    n_rows, n_cols, n_predict,
+    A, B, C,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
+
+    max_val = -float('inf')
+    sum_exp = 0.0
+
+    for off in range(0, n_cols, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        val = tl.load(logits_row_ptr + cols, mask=mask, other=-float('inf')).to(tl.float32)
+        z = A * tl.sigmoid((val + B) / C)
+        z = tl.where(mask, z, -float('inf'))
+        curr_max = tl.max(z, axis=0)
+        new_max = tl.maximum(max_val, curr_max)
+        sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tl.exp(z - new_max), axis=0)
+        max_val = new_max
+
+    lse = max_val + tl.log(sum_exp)
+    tl.store(lse_ptr + row_idx, lse)
+
+    total_loss = 0.0
+    for k in range(n_predict):
+        target_idx = row_idx + k
+        if target_idx < n_rows:
+            weight = tl.load(mtp_weights_ptr + k)
+            if weight > 0:
+                target = tl.load(targets_ptr + target_idx).to(tl.int32)
+                if target >= 0 and target < n_cols:
+                    val_target = tl.load(logits_row_ptr + target).to(tl.float32)
+                    z_target = A * tl.sigmoid((val_target + B) / C)
+                    total_loss += weight * (lse - z_target)
+
+    tl.store(losses_ptr + row_idx, total_loss)
+
+@triton.jit
+def fused_softcapped_entropy_bwd_kernel(
+    grad_input_ptr, grad_output_ptr, lse_ptr, logits_ptr, targets_ptr, mtp_weights_ptr,
+    stride_logits_n, stride_logits_v, stride_grad_n, stride_grad_v,
+    n_rows, n_cols, n_predict,
+    A, B, C,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+
+    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
+    grad_row_ptr = grad_input_ptr + row_idx * stride_grad_n
+
+    lse = tl.load(lse_ptr + row_idx)
+    grad_loss = tl.load(grad_output_ptr + row_idx)
+
+    S_w = 0.0
+    for k in range(n_predict):
+        if row_idx + k < n_rows:
+            S_w += tl.load(mtp_weights_ptr + k)
+
+    for off in range(0, n_cols, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        val = tl.load(logits_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        u = (val + B) / C
+        sigmoid_u = tl.sigmoid(u)
+        z = A * sigmoid_u
+        p = tl.exp(z - lse)
+
+        term1 = S_w * p
+        term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        for k in range(n_predict):
+            if row_idx + k < n_rows:
+                target = tl.load(targets_ptr + row_idx + k).to(tl.int32)
+                weight = tl.load(mtp_weights_ptr + k)
+                term2 += tl.where(cols == target, weight, 0.0)
+
+        grad_z = grad_loss * (term1 - term2)
+        dz_dx = (1.0 / C) * z * (1.0 - sigmoid_u)
+        grad_x = grad_z * dz_dx
+        tl.store(grad_row_ptr + cols, grad_x.to(tl.bfloat16), mask=mask)
+
+class FusedSoftcappedCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, targets, mtp_weights, A=23.0, B=5.0, C=7.5):
+        n_rows, n_cols = logits.shape
+        if mtp_weights is None:
+             mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
+        n_predict = mtp_weights.shape[0]
+
+        losses = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+        lse = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+
+        logits = logits.contiguous()
+        targets = targets.contiguous()
+        mtp_weights = mtp_weights.contiguous()
+
+        grid = (n_rows,)
+        fused_softcapped_entropy_fwd_kernel[grid](
+            logits, losses, lse, targets, mtp_weights,
+            logits.stride(0), logits.stride(1),
+            n_rows, n_cols, n_predict,
+            A, B, C,
+            BLOCK_SIZE=1024,
+            num_warps=8,
+            num_stages=4
+        )
+
+        ctx.save_for_backward(logits, targets, mtp_weights, lse)
+        ctx.params = (A, B, C)
+        return losses
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, targets, mtp_weights, lse = ctx.saved_tensors
+        A, B, C = ctx.params
+        n_rows, n_cols = logits.shape
+        n_predict = mtp_weights.shape[0]
+
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.bfloat16, device=logits.device)
+        grad_output = grad_output.contiguous()
+
+        grid = (n_rows,)
+        fused_softcapped_entropy_bwd_kernel[grid](
+            grad_input, grad_output, lse, logits, targets, mtp_weights,
+            logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
+            n_rows, n_cols, n_predict,
+            A, B, C,
+            BLOCK_SIZE=1024,
+            num_warps=8,
+            num_stages=4
+        )
+        return grad_input, None, None, None, None, None
+
+====================================================================================================
+Running Python 3.11.9 | packaged by conda-forge | (main, Apr 19 2024, 18:36:13) [GCC 12.3.0]
+Running PyTorch 2.10.0.dev20251210+cu126 compiled for CUDA 12.6
+Running Triton version 3.6.0
+Tue Feb  3 16:37:46 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.172.08             Driver Version: 570.172.08     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          Off |   00000000:05:00.0 Off |                    0 |
+| N/A   37C    P0            127W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          Off |   00000000:08:00.0 Off |                    0 |
+| N/A   34C    P0            116W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          Off |   00000000:65:00.0 Off |                    0 |
+| N/A   36C    P0            123W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          Off |   00000000:68:00.0 Off |                    0 |
+| N/A   32C    P0            120W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H100 80GB HBM3          Off |   00000000:85:00.0 Off |                    0 |
+| N/A   37C    P0            126W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H100 80GB HBM3          Off |   00000000:88:00.0 Off |                    0 |
+| N/A   32C    P0            126W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H100 80GB HBM3          Off |   00000000:E5:00.0 Off |                    0 |
+| N/A   37C    P0            122W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H100 80GB HBM3          Off |   00000000:E8:00.0 Off |                    0 |
+| N/A   33C    P0            118W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A          254431      C   /opt/conda/bin/python                  1510MiB |
+|    1   N/A  N/A          254432      C   /opt/conda/bin/python                  1510MiB |
+|    2   N/A  N/A          254433      C   /opt/conda/bin/python                  1510MiB |
+|    3   N/A  N/A          254434      C   /opt/conda/bin/python                  1510MiB |
+|    4   N/A  N/A          254435      C   /opt/conda/bin/python                  1510MiB |
+|    5   N/A  N/A          254436      C   /opt/conda/bin/python                  1510MiB |
+|    6   N/A  N/A          254437      C   /opt/conda/bin/python                  2170MiB |
+|    7   N/A  N/A          254438      C   /opt/conda/bin/python                  1770MiB |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+Compiling model and warming up kernels (~7 minutes on first execution)
+Sampling steps [0, 1, 2, 504, 505, 506, 1009, 1010, 1011, 1514, 1515, 1516] for warmup
+Resetting Model
+step:0/1555 val_loss:10.8313 lr_mul:1.0000 train_time:0ms step_avg:0.03ms
+step:1/1555 lr_mul:1.0000 train_time:110ms step_avg:110.48ms
+step:2/1555 lr_mul:1.0000 train_time:130ms step_avg:64.92ms
+step:3/1555 lr_mul:1.0000 train_time:148ms step_avg:49.22ms
+step:4/1555 lr_mul:1.0000 train_time:755ms step_avg:188.64ms
+step:5/1555 lr_mul:1.0000 train_time:774ms step_avg:154.74ms
+step:6/1555 lr_mul:1.0000 train_time:1348ms step_avg:224.68ms
+step:7/1555 lr_mul:1.0000 train_time:1367ms step_avg:195.28ms
+step:8/1555 lr_mul:1.0000 train_time:1942ms step_avg:242.71ms
+step:9/1555 lr_mul:1.0000 train_time:1962ms step_avg:218.03ms
+step:10/1555 lr_mul:1.0000 train_time:2538ms step_avg:253.76ms
+step:10/1555 val_loss:7.6615 lr_mul:1.0000 train_time:2561ms step_avg:256.10ms
+step:11/1555 lr_mul:1.0000 train_time:2581ms step_avg:234.60ms
+step:12/1555 lr_mul:1.0000 train_time:3155ms step_avg:262.91ms
+step:13/1555 lr_mul:1.0000 train_time:3174ms step_avg:244.14ms
+step:14/1555 lr_mul:1.0000 train_time:3771ms step_avg:269.34ms
+step:15/1555 lr_mul:1.0000 train_time:3790ms step_avg:252.68ms
+step:16/1555 lr_mul:1.0000 train_time:4369ms step_avg:273.08ms
+step:17/1555 lr_mul:1.0000 train_time:4388ms step_avg:258.15ms

@@ -9,6 +9,175 @@ CONSTANT_FINAL_BATCH_SIZES = [131072, 262144, 262144, 262144]
 CONSTANT_DOUBLE_FINAL_BATCH_SIZES = [131072, 262144, 524288, 524288]
 CONFIGS = [
     # {
+    #     "tag": "baseline_std",
+    #     "lr_muls": [1.0, 1.52, 1.73, 1.0],
+    #     "cooldown_frac": 0.55,
+    #     "batch_sizes": DEFAULT_BATCH_SIZES,
+    #     "script": "train_gpt.py",
+    # },
+    # {
+    #     "tag": "baseline_muon_new",
+    #     "lr_muls": [1.0, 1.52, 1.73, 1.0],
+    #     "cooldown_frac": 0.55,
+    #     "batch_sizes": DEFAULT_BATCH_SIZES,
+    #     "script": "train_gpt_muon_new.py",
+    # },
+    # Previous runs (baseline comparison)
+    # {
+    #     "tag": "baseline_std",
+    #     "lr_muls": [1.0, 1.52, 1.73, 1.0],
+    #     "cooldown_frac": 0.55,
+    #     "batch_sizes": DEFAULT_BATCH_SIZES,
+    #     "script": "train_gpt.py",
+    #     "val_loss_every": 50,
+    # },
+    # {
+    #     "tag": "spectral_lr_0.1",
+    #     "lr_muls": [1.0, 1.52, 1.73, 1.0],
+    #     "cooldown_frac": 0.55,
+    #     "batch_sizes": DEFAULT_BATCH_SIZES,
+    #     "script": "train_gpt_muon_new.py",
+    #     "spectral_lr_mul": 0.1,
+    #     "val_loss_every": 50,
+    # },
+    # {
+    #     "tag": "spectral_lr_0.5",
+    #     "lr_muls": [1.0, 1.52, 1.73, 1.0],
+    #     "cooldown_frac": 0.55,
+    #     "batch_sizes": DEFAULT_BATCH_SIZES,
+    #     "script": "train_gpt_muon_new.py",
+    #     "spectral_lr_mul": 0.5,
+    #     "val_loss_every": 50,
+    # },
+
+    # Fine-grained sweep between 0 and 0.3
+    # {
+    #     "tag": "baseline_muon_init",
+    #     "lr_muls": [1.0, 1.52, 1.73, 1.0],
+    #     "cooldown_frac": 0.55,
+    #     "batch_sizes": DEFAULT_BATCH_SIZES,
+    #     "script": "train_gpt_init.py",
+    #     "val_loss_every": 50,
+    # },
+    # {
+    #     "tag": "spectral_lr_0.05",
+    #     "lr_muls": [1.0, 1.52, 1.73, 1.0],
+    #     "cooldown_frac": 0.55,
+    #     "batch_sizes": DEFAULT_BATCH_SIZES,
+    #     "script": "train_gpt_muon_new.py",
+    #     "spectral_lr_mul": 0.05,
+    #     "val_loss_every": 50,
+    # },
+    # {
+    #     "tag": "spectral_lr_0.08",
+    #     "lr_muls": [1.0, 1.52, 1.73, 1.0],
+    #     "cooldown_frac": 0.55,
+    #     "batch_sizes": DEFAULT_BATCH_SIZES,
+    #     "script": "train_gpt_muon_new.py",
+    #     "spectral_lr_mul": 0.08,
+    #     "val_loss_every": 50,
+    # },
+    # {
+    #     "tag": "spectral_lr_0.15",
+    #     "lr_muls": [1.0, 1.52, 1.73, 1.0],
+    #     "cooldown_frac": 0.55,
+    #     "batch_sizes": DEFAULT_BATCH_SIZES,
+    #     "script": "train_gpt_muon_new.py",
+    #     "spectral_lr_mul": 0.15,
+    #     "val_loss_every": 50,
+    # },
+
+    # New fine-grained sweep: 0.02, 0.03, 0.05, 0.07, 0.12, 0.15, 0.2, 0.25, 0.3
+    {
+        "tag": "spectral_lr_0.02",
+        "lr_muls": [1.0, 1.52, 1.73, 1.0],
+        "cooldown_frac": 0.55,
+        "batch_sizes": DEFAULT_BATCH_SIZES,
+        "script": "train_gpt_muon_new.py",
+        "spectral_lr_mul": 0.02,
+        "val_loss_every": 50,
+    },
+    {
+        "tag": "spectral_lr_0.03",
+        "lr_muls": [1.0, 1.52, 1.73, 1.0],
+        "cooldown_frac": 0.55,
+        "batch_sizes": DEFAULT_BATCH_SIZES,
+        "script": "train_gpt_muon_new.py",
+        "spectral_lr_mul": 0.03,
+        "val_loss_every": 50,
+    },
+    {
+        "tag": "spectral_lr_0.05",
+        "lr_muls": [1.0, 1.52, 1.73, 1.0],
+        "cooldown_frac": 0.55,
+        "batch_sizes": DEFAULT_BATCH_SIZES,
+        "script": "train_gpt_muon_new.py",
+        "spectral_lr_mul": 0.05,
+        "val_loss_every": 50,
+    },
+    {
+        "tag": "spectral_lr_0.07",
+        "lr_muls": [1.0, 1.52, 1.73, 1.0],
+        "cooldown_frac": 0.55,
+        "batch_sizes": DEFAULT_BATCH_SIZES,
+        "script": "train_gpt_muon_new.py",
+        "spectral_lr_mul": 0.07,
+        "val_loss_every": 50,
+    },
+    {
+        "tag": "spectral_lr_0.12",
+        "lr_muls": [1.0, 1.52, 1.73, 1.0],
+        "cooldown_frac": 0.55,
+        "batch_sizes": DEFAULT_BATCH_SIZES,
+        "script": "train_gpt_muon_new.py",
+        "spectral_lr_mul": 0.12,
+        "val_loss_every": 50,
+    },
+    {
+        "tag": "spectral_lr_0.15",
+        "lr_muls": [1.0, 1.52, 1.73, 1.0],
+        "cooldown_frac": 0.55,
+        "batch_sizes": DEFAULT_BATCH_SIZES,
+        "script": "train_gpt_muon_new.py",
+        "spectral_lr_mul": 0.15,
+        "val_loss_every": 50,
+    },
+    {
+        "tag": "spectral_lr_0.2",
+        "lr_muls": [1.0, 1.52, 1.73, 1.0],
+        "cooldown_frac": 0.55,
+        "batch_sizes": DEFAULT_BATCH_SIZES,
+        "script": "train_gpt_muon_new.py",
+        "spectral_lr_mul": 0.2,
+        "val_loss_every": 50,
+    },
+    {
+        "tag": "spectral_lr_0.25",
+        "lr_muls": [1.0, 1.52, 1.73, 1.0],
+        "cooldown_frac": 0.55,
+        "batch_sizes": DEFAULT_BATCH_SIZES,
+        "script": "train_gpt_muon_new.py",
+        "spectral_lr_mul": 0.25,
+        "val_loss_every": 50,
+    },
+    {
+        "tag": "spectral_lr_0.3",
+        "lr_muls": [1.0, 1.52, 1.73, 1.0],
+        "cooldown_frac": 0.55,
+        "batch_sizes": DEFAULT_BATCH_SIZES,
+        "script": "train_gpt_muon_new.py",
+        "spectral_lr_mul": 0.3,
+        "val_loss_every": 50,
+    },
+    # {
+    #     "tag": "baseline_muon_new_spec0",
+    #     "lr_muls": [1.0, 1.52, 1.73, 1.0],
+    #     "cooldown_frac": 0.55,
+    #     "batch_sizes": DEFAULT_BATCH_SIZES,
+    #     "script": "train_gpt_muon_new.py",
+    #     "spectral_lr_mul": 0.0,
+    # },
+    # {
     #     "tag": "baseline",
     #     "lr_muls": [1.0, 1.52, 1.73, 1.0],
     #     "cooldown_frac": 0.55,
@@ -75,26 +244,26 @@ CONFIGS = [
     #     "lr_decay_type": "exp",
     #     "batch_sizes": CONSTANT_DOUBLE_FINAL_BATCH_SIZES,
     # },
-    {
-        "tag": "two_stage_300_exp_decayx2_const1000_1",
-        "lr_muls": [1.52, 1.52, 1.52, 1.52],
-        # cooldown starts at ~step 300 for NUM_SCHEDULED_ITERATIONS=1560
-        "cooldown_frac": 0.8075,
-        "lr_decay_type": "exp",
-        "lr_decay_switch_step": 1000,
-        "lr_decay_second_type": "constant",
-        "batch_sizes": CONSTANT_DOUBLE_FINAL_BATCH_SIZES,
-    },
-    {
-        "tag": "two_stage_300_exp_decayx2_linear1000_1",
-        "lr_muls": [1.52, 1.52, 1.52, 1.52],
-        # cooldown starts at ~step 300 for NUM_SCHEDULED_ITERATIONS=1560
-        "cooldown_frac": 0.8075,
-        "lr_decay_type": "exp",
-        "lr_decay_switch_step": 1000,
-        "lr_decay_second_type": "linear",
-        "batch_sizes": CONSTANT_DOUBLE_FINAL_BATCH_SIZES,
-    },
+    # {
+    #     "tag": "two_stage_300_exp_decayx2_const1000_1",
+    #     "lr_muls": [1.52, 1.52, 1.52, 1.52],
+    #     # cooldown starts at ~step 300 for NUM_SCHEDULED_ITERATIONS=1560
+    #     "cooldown_frac": 0.8075,
+    #     "lr_decay_type": "exp",
+    #     "lr_decay_switch_step": 1000,
+    #     "lr_decay_second_type": "constant",
+    #     "batch_sizes": CONSTANT_DOUBLE_FINAL_BATCH_SIZES,
+    # },
+    # {
+    #     "tag": "two_stage_300_exp_decayx2_linear1000_1",
+    #     "lr_muls": [1.52, 1.52, 1.52, 1.52],
+    #     # cooldown starts at ~step 300 for NUM_SCHEDULED_ITERATIONS=1560
+    #     "cooldown_frac": 0.8075,
+    #     "lr_decay_type": "exp",
+    #     "lr_decay_switch_step": 1000,
+    #     "lr_decay_second_type": "linear",
+    #     "batch_sizes": CONSTANT_DOUBLE_FINAL_BATCH_SIZES,
+    # },
     # {
     #     "tag": "two_stage_1000_constx2",
     #     "lr_muls": [1.52, 1.52, 1.52, 1.52],
@@ -168,11 +337,13 @@ def main() -> None:
             env["LR_DECAY_SECOND_TYPE"] = str(cfg["lr_decay_second_type"])
         if "lr_decay_second_final" in cfg:
             env["LR_DECAY_SECOND_FINAL"] = str(cfg["lr_decay_second_final"])
+        if "spectral_lr_mul" in cfg:
+            env["SPECTRAL_LR_MUL"] = str(cfg["spectral_lr_mul"])
         batch_sizes = cfg.get("batch_sizes", DEFAULT_BATCH_SIZES)
         env["BATCH_SIZES"] = ",".join(str(v) for v in batch_sizes)
         env["NUM_SCHEDULED_ITERATIONS"] = "1560"
         env["NUM_EXTENSION_ITERATIONS"] = "40"
-        env["VAL_LOSS_EVERY"] = "10"
+        env["VAL_LOSS_EVERY"] = str(cfg.get("val_loss_every", 10))
         env["VAL_LOSS_LAST_STEPS"] = "100"
         env["VAL_LOSS_EVERY_LAST"] = "10"
         env["LD_LIBRARY_PATH"] = (
@@ -180,12 +351,13 @@ def main() -> None:
             + env.get("LD_LIBRARY_PATH", "")
         )
 
+        script = cfg.get("script", "train_gpt.py")
         cmd = [
             "torchrun",
             "--standalone",
             "--nproc_per_node",
             str(nproc),
-            "train_gpt.py",
+            script,
         ]
 
         print(f"[{idx}/{len(CONFIGS)}] RUN_ID={run_id}")

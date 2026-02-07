@@ -20,6 +20,9 @@ def parse_log_file(log_path):
     val_losses = []
     train_times = []
     lr_muls = []
+    spec_steps = []
+    spec_attn = []
+    spec_mlp = []
 
     # Also track all steps with lr_mul, betas, and batch_size (including training steps)
     all_steps = []
@@ -46,6 +49,21 @@ def parse_log_file(log_path):
                 lr_muls.append(lr_mul)
                 train_times.append(train_time)
 
+                spec_attn_match = re.search(r'spec_attn:\[([0-9eE+.,\-\s]+)\]', line)
+                spec_mlp_match = re.search(r'spec_mlp:\[([0-9eE+.,\-\s]+)\]', line)
+                if spec_attn_match or spec_mlp_match:
+                    spec_steps.append(step)
+                    if spec_attn_match:
+                        attn_vals = [float(x) for x in spec_attn_match.group(1).split(',') if x.strip()]
+                    else:
+                        attn_vals = []
+                    if spec_mlp_match:
+                        mlp_vals = [float(x) for x in spec_mlp_match.group(1).split(',') if x.strip()]
+                    else:
+                        mlp_vals = []
+                    spec_attn.append(attn_vals)
+                    spec_mlp.append(mlp_vals)
+
             # Match all lines with lr_mul, betas, and batch_size (training and validation)
             batch_match = re.search(r'step:(\d+)/\d+\s+.*?lr_mul:([\d.]+)\s+beta1:([\d.]+)\s+beta2:([\d.]+)\s+batch_size:(\d+)', line)
             if batch_match:
@@ -69,7 +87,7 @@ def parse_log_file(log_path):
                         all_steps.append(int(lr_match.group(1)))
                         all_lr_muls.append(float(lr_match.group(2)))
 
-    return steps, val_losses, train_times, lr_muls, all_steps, all_lr_muls, all_beta1s, all_beta2s, all_batch_sizes
+    return steps, val_losses, train_times, lr_muls, all_steps, all_lr_muls, all_beta1s, all_beta2s, all_batch_sizes, spec_steps, spec_attn, spec_mlp
 
 def plot_losses(log_paths):
     """Create plots for validation loss, learning rate, and training time.
@@ -84,7 +102,9 @@ def plot_losses(log_paths):
     # Parse all log files
     all_data = []
     for log_path in log_paths:
-        steps, val_losses, train_times, lr_muls, all_steps, all_lr_muls, all_beta1s, all_beta2s, all_batch_sizes = parse_log_file(log_path)
+        (steps, val_losses, train_times, lr_muls,
+         all_steps, all_lr_muls, all_beta1s, all_beta2s, all_batch_sizes,
+         spec_steps, spec_attn, spec_mlp) = parse_log_file(log_path)
         if not steps:
             print(f"Warning: No validation loss data found in {log_path}")
             continue
@@ -100,14 +120,17 @@ def plot_losses(log_paths):
             'all_beta1s': all_beta1s,
             'all_beta2s': all_beta2s,
             'all_batch_sizes': all_batch_sizes,
+            'spec_steps': spec_steps,
+            'spec_attn': spec_attn,
+            'spec_mlp': spec_mlp,
         })
 
     if not all_data:
         print("No data to plot")
         return
 
-    # Create figure with five subplots
-    fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(5, 1, figsize=(10, 22))
+    # Create figure with six subplots
+    fig, (ax1, ax2, ax3, ax4, ax5, ax6) = plt.subplots(6, 1, figsize=(10, 26))
 
     # Define colors for multiple runs
     colors = plt.cm.tab10(range(len(all_data)))
@@ -122,7 +145,7 @@ def plot_losses(log_paths):
 
     ax1.set_xlabel('Step', fontsize=12)
     ax1.set_ylabel('Validation Loss', fontsize=12)
-    ax1.set_ylim(3.2, 5.25)
+    ax1.set_ylim(3.2, 4)
 
     if len(all_data) == 1:
         ax1.set_title(f'Validation Loss Over Time\n{all_data[0]["name"]}', fontsize=14)
@@ -303,13 +326,76 @@ def plot_losses(log_paths):
                     bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.5),
                     fontsize=11)
 
+    # Plot spectral ratios
+    has_spectral_data = any(data['spec_steps'] and (data['spec_attn'] or data['spec_mlp']) for data in all_data)
+
+    if has_spectral_data:
+        ax6.set_xlabel('Step', fontsize=12)
+        ax6.set_ylabel('Mean |Spectral Ratio|', fontsize=12)
+        ax6.set_yscale('log')
+        ax6.grid(True, alpha=0.3)
+
+        if len(all_data) == 1:
+            # Single run: show per-layer detail
+            ax6.set_title('Per-Layer Spectral Ratios', fontsize=14)
+            data = all_data[0]
+            if data['spec_steps']:
+                steps = data['spec_steps']
+                if data['spec_attn']:
+                    # Transpose to per-layer series
+                    attn_layers = list(zip(*data['spec_attn']))
+                    cmap = plt.cm.viridis
+                    for i, series in enumerate(attn_layers):
+                        color = cmap(i / max(1, len(attn_layers) - 1))
+                        ax6.plot(steps, [abs(x) for x in series], color=color, linewidth=1.5, alpha=0.9)
+
+                if data['spec_mlp']:
+                    mlp_layers = list(zip(*data['spec_mlp']))
+                    cmap = plt.cm.plasma
+                    for i, series in enumerate(mlp_layers):
+                        color = cmap(i / max(1, len(mlp_layers) - 1))
+                        ax6.plot(steps, [abs(x) for x in series], color=color, linewidth=1.2, alpha=0.7, linestyle='--')
+        else:
+            # Multiple runs: show mean evolution
+            ax6.set_title('Spectral Ratio Evolution Comparison', fontsize=14)
+            import numpy as np
+            for i, data in enumerate(all_data):
+                if data['spec_steps']:
+                    steps = data['spec_steps']
+                    # Compute mean absolute spectral ratio across all layers
+                    mean_attn = []
+                    mean_mlp = []
+
+                    for attn_vals, mlp_vals in zip(data['spec_attn'], data['spec_mlp']):
+                        if attn_vals:
+                            mean_attn.append(np.mean(np.abs(attn_vals)))
+                        if mlp_vals:
+                            # Filter out zeros in MLP (padding)
+                            mlp_nonzero = [abs(x) for x in mlp_vals if x != 0.0]
+                            if mlp_nonzero:
+                                mean_mlp.append(np.mean(mlp_nonzero))
+
+                    if mean_attn:
+                        ax6.plot(steps, mean_attn, color=colors[i], linewidth=2,
+                                marker='o', markersize=3, alpha=0.8, label=f"{data['name']} (attn)")
+                    if mean_mlp:
+                        ax6.plot(steps, mean_mlp, color=colors[i], linewidth=2,
+                                linestyle='--', marker='s', markersize=3, alpha=0.8, label=f"{data['name']} (mlp)")
+
+            ax6.legend(loc='best', fontsize=9)
+    else:
+        ax6.axis('off')
+
     plt.tight_layout()
 
     # Save the plot
     if len(all_data) == 1:
         output_path = Path(all_data[0]['path']).with_suffix('.png')
     else:
-        output_path = Path('logs/comparison.png')
+        # Create a specific name using timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        output_path = Path(f'logs/comparison_{len(all_data)}runs_{timestamp}.png')
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"Plot saved to: {output_path}")
 
